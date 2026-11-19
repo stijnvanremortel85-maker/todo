@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="nl-BE">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#c62828">
+<title>To Do Stijn</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<style>
+  :root { --red:#c62828; --bg:#111; --fg:#f5f5f5; --muted:#9e9e9e; --ok:#2e7d32; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family:system-ui,-apple-system,Roboto,sans-serif; }
+  main { min-height:100%; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; padding:24px; gap:22px; text-align:center; }
+  h1 { font-size:20px; font-weight:600; margin:0; color:var(--muted); }
+  #status { font-size:22px; min-height:1.4em; }
+  #timer { font-size:56px; font-variant-numeric:tabular-nums; font-weight:300; }
+  .dot { width:18px; height:18px; border-radius:50%; background:var(--red);
+    display:inline-block; margin-right:10px; animation:pulse 1.2s infinite; vertical-align:middle; }
+  @keyframes pulse { 50% { opacity:.25; } }
+  button { font:inherit; border:0; border-radius:999px; cursor:pointer; }
+  #main-btn { width:220px; height:220px; font-size:26px; font-weight:600;
+    background:var(--red); color:#fff; box-shadow:0 0 0 10px rgba(198,40,40,.25); }
+  #main-btn.start { background:#333; box-shadow:none; }
+  #cancel-btn, .small { background:#2a2a2a; color:var(--fg); padding:12px 26px; font-size:17px; }
+  #result { max-width:560px; width:100%; text-align:left; white-space:pre-wrap; background:#1d1d1d;
+    border-radius:14px; padding:16px; line-height:1.5; display:none; }
+  .ok { color:#81c784; } .err { color:#ef9a9a; }
+  .hidden { display:none !important; }
+  form { width:100%; max-width:480px; text-align:left; display:flex; flex-direction:column; gap:10px; }
+  label { font-size:15px; color:var(--muted); }
+  input { font:inherit; padding:12px; border-radius:10px; border:1px solid #444; background:#1d1d1d; color:var(--fg); }
+  form button { background:var(--red); color:#fff; padding:14px; font-size:18px; margin-top:8px; }
+  #settings-link { color:var(--muted); font-size:14px; background:none; text-decoration:underline; }
+</style>
+</head>
+<body>
+<main>
+  <h1>To Do Stijn</h1>
+
+  <section id="setup" class="hidden">
+    <form id="setup-form">
+      <p>Eenmalige instelling (zie handleiding):</p>
+      <label for="url">URL van het Google-script (eindigt op /exec)</label>
+      <input id="url" type="url" required placeholder="https://script.google.com/macros/s/.../exec">
+      <button type="submit">Opslaan en starten</button>
+    </form>
+  </section>
+
+  <section id="recorder" class="hidden" style="display:flex;flex-direction:column;align-items:center;gap:22px">
+    <div id="status"></div>
+    <div id="timer">0:00</div>
+    <button id="main-btn">Stop &amp;<br>verstuur</button>
+    <button id="cancel-btn">Annuleer</button>
+    <div id="result"></div>
+    <button id="settings-link">Instellingen</button>
+  </section>
+</main>
+
+<script>
+(() => {
+  const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwfZUmgsGqes4nGbC19P7_6Ph0w3BPmPhGrDkYydjxMLiV3UFe0WynlcRG2fFdqR9jwOg/exec';  // URL van het Google-script
+  const MAX_SECONDS = 300;            // opname stopt automatisch na 5 minuten
+  const $ = id => document.getElementById(id);
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch {} }
+  };
+
+  let state = 'idle';                 // idle | recording | sending | done | error
+  let recorder = null, stream = null, chunks = [], timerId = null, startTime = 0;
+  let lastBlob = null, cancelled = false;
+
+  const statusEl = $('status'), timerEl = $('timer'), mainBtn = $('main-btn'),
+        cancelBtn = $('cancel-btn'), resultEl = $('result');
+
+  function config() {
+    return { url: store.get('todo_url') || SCRIPT_URL };
+  }
+
+  function show(section) {
+    $('setup').classList.toggle('hidden', section !== 'setup');
+    $('recorder').classList.toggle('hidden', section !== 'recorder');
+  }
+
+  function setUI(newState, msg, cls) {
+    state = newState;
+    statusEl.className = cls || '';
+    statusEl.innerHTML = msg || '';
+    mainBtn.classList.toggle('start', newState !== 'recording');
+    mainBtn.disabled = newState === 'sending';
+    mainBtn.innerHTML = newState === 'recording' ? 'Stop &amp;<br>verstuur'
+                      : newState === 'sending' ? 'Bezig…'
+                      : newState === 'error' && lastBlob ? 'Opnieuw<br>versturen'
+                      : 'Nieuwe<br>opname';
+    cancelBtn.classList.toggle('hidden', newState !== 'recording');
+    timerEl.classList.toggle('hidden', newState !== 'recording');
+  }
+
+  function pickMime() {
+    const opts = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+    for (const m of opts) if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m;
+    return '';
+  }
+
+  async function startRecording() {
+    if (state === 'recording' || state === 'sending') return;
+    resultEl.style.display = 'none';
+    lastBlob = null; cancelled = false; chunks = [];
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:true, noiseSuppression:true } });
+    } catch (e) {
+      setUI('idle', 'Geen toegang tot de microfoon. Tik op de knop om te starten en geef toestemming.', 'err');
+      return;
+    }
+    const mime = pickMime();
+    recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+    recorder.onstop = onStopped;
+    recorder.start(1000);
+    startTime = Date.now();
+    timerEl.textContent = '0:00';
+    timerId = setInterval(tick, 250);
+    setUI('recording', '<span class="dot"></span>Opname loopt… spreek je boodschap in');
+    if (navigator.vibrate) navigator.vibrate(80);
+  }
+
+  function tick() {
+    const s = Math.floor((Date.now() - startTime) / 1000);
+    timerEl.textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+    if (s >= MAX_SECONDS) stopRecording();
+  }
+
+  function stopRecording(cancel) {
+    cancelled = !!cancel;
+    clearInterval(timerId);
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+    if (stream) stream.getTracks().forEach(t => t.stop());
+  }
+
+  function onStopped() {
+    if (cancelled) { setUI('idle', 'Opname geannuleerd.'); return; }
+    const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+    if (blob.size < 2000) { setUI('idle', 'Opname was te kort.', 'err'); return; }
+    lastBlob = blob;
+    send(blob);
+  }
+
+  function blobToBase64(blob) {
+    return new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(String(r.result).split(',')[1]);
+      r.onerror = rej;
+      r.readAsDataURL(blob);
+    });
+  }
+
+  async function send(blob) {
+    const { url } = config();
+    setUI('sending', 'Omzetten naar tekst en versturen…');
+    try {
+      const audio = await blobToBase64(blob);
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },  // vermijdt CORS-preflight
+        body: JSON.stringify({ mime: blob.type, audio })
+      });
+      const data = await resp.json();
+      if (!data.ok) throw new Error(data.error || 'Onbekende fout');
+      lastBlob = null;
+      setUI('done', '✓ Verstuurd naar je mailbox', 'ok');
+      resultEl.textContent = data.text;
+      resultEl.style.display = 'block';
+      if (navigator.vibrate) navigator.vibrate([60, 60, 60]);
+    } catch (e) {
+      setUI('error', 'Versturen mislukt: ' + e.message + '<br>Controleer je verbinding en probeer opnieuw.', 'err');
+    }
+  }
+
+  mainBtn.addEventListener('click', () => {
+    if (state === 'recording') stopRecording(false);
+    else if (state === 'error' && lastBlob) send(lastBlob);
+    else startRecording();
+  });
+  cancelBtn.addEventListener('click', () => stopRecording(true));
+  $('settings-link').addEventListener('click', () => {
+    if (state === 'recording') stopRecording(true);
+    const c = config();
+    $('url').value = c.url || '';
+    show('setup');
+  });
+  $('setup-form').addEventListener('submit', e => {
+    e.preventDefault();
+    store.set('todo_url', $('url').value.trim());
+    show('recorder');
+    startRecording();
+  });
+
+  // Wanneer je de app opnieuw opent vanuit de achtergrond: meteen een nieuwe opname
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && (state === 'done' || state === 'idle') && !config().url.startsWith('__')) {
+      startRecording();
+    }
+  });
+
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+
+  const c = config();
+  if (!c.url || c.url.startsWith('__')) { show('setup'); }
+  else { show('recorder'); setUI('idle', ''); startRecording(); }
+})();
+</script>
+</body>
+</html>
